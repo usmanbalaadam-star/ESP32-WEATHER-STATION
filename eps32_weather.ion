@@ -1,0 +1,205 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+
+// --- config ---
+const char* ssid = "put your ssid here";
+const char* password = "put your password here";
+const char* openWeatherKey = "put your open weather API here";
+const char* thingSpeakKey = "put your things speak API here";
+const char* city = "Lagos";
+const char* country = "NG";
+
+#define DHTPIN 4
+#define DHTTYPE DHT22
+
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned long lastUpdate = 0;
+const unsigned long interval = 60000;
+
+// --- wifi reconnect ---
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  
+  Serial.println("wifi lost, reconnecting");
+  WiFi.disconnect();
+  delay(100);
+  WiFi.begin(ssid, password);
+  
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 20) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(" connected");
+  } else {
+    Serial.println(" failed");
+  }
+}
+
+// --- get online weather ---
+bool getOnlineWeather(float* temp, int* hum) {
+  HTTPClient http;
+  
+  String url = "http://api.openweathermap.org/data/2.5/weather?q=";
+  url += city;
+  url += ",";
+  url += country;
+  url += "&units=metric&appid=";
+  url += openWeatherKey;
+  
+  http.begin(url);
+  int code = http.GET();
+  
+  bool ok = false;
+  
+  if (code == 200) {
+    String payload = http.getString();
+    StaticJsonDocument<1024> doc;
+    
+    if (!deserializeJson(doc, payload)) {
+      *temp = doc["main"]["temp"];
+      *hum = doc["main"]["humidity"];
+      ok = true;
+    }
+  }
+  
+  http.end();
+  return ok;
+}
+
+// --- send to thingspeak ---
+bool sendData(float localTemp, float localHum, float onlineTemp, int onlineHum, bool haveOnline) {
+  for (int i = 0; i < 3; i++) {
+    HTTPClient http;
+    
+    char f1[10], f2[10], f3[10];
+    dtostrf(localTemp, 0, 2, f1);
+    dtostrf(localHum, 0, 2, f2);
+    
+    String url = "http://api.thingspeak.com/update?api_key=";
+    url += thingSpeakKey;
+    url += "&field1=";
+    url += f1;
+    url += "&field2=";
+    url += f2;
+    
+    if (haveOnline) {
+      dtostrf(onlineTemp, 0, 2, f3);
+      url += "&field3=";
+      url += f3;
+      url += "&field4=";
+      url += onlineHum;
+    }
+    
+    Serial.print("sending: ");
+    Serial.println(url);
+    
+    http.begin(url);
+    int code = http.GET();
+    
+    String resp = "";
+    if (code > 0) resp = http.getString();
+    
+    http.end();
+    
+    if (code == 200) {
+      Serial.print("entry id: ");
+      Serial.println(resp);
+      
+      if (resp == "0") {
+        Serial.println("rejected by thingspeak");
+        return false;
+      }
+      
+      return true;
+    }
+    
+    Serial.print("attempt ");
+    Serial.print(i + 1);
+    Serial.print(" failed, code ");
+    Serial.println(code);
+    
+    if (i < 2) delay(2000);
+  }
+  
+  return false;
+}
+
+// --- setup ---
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  dht.begin();
+  
+  WiFi.begin(ssid, password);
+  Serial.print("connecting wifi");
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println(" ok");
+  Serial.print("ip: ");
+  Serial.println(WiFi.localIP());
+}
+
+// --- loop ---
+void loop() {
+  if (millis() - lastUpdate < interval) return;
+  lastUpdate = millis();
+  
+  connectWiFi();
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("no wifi, skip");
+    return;
+  }
+  
+  // read local sensor
+  float localTemp = dht.readTemperature();
+  float localHum = dht.readHumidity();
+  
+  if (isnan(localTemp) || isnan(localHum)) {
+    Serial.println("dht read failed");
+    return;
+  }
+  
+  Serial.print("local: ");
+  Serial.print(localTemp);
+  Serial.print(" C, ");
+  Serial.print(localHum);
+  Serial.println("%");
+  
+  // get online weather
+  float onlineTemp = 0;
+  int onlineHum = 0;
+  bool haveOnline = getOnlineWeather(&onlineTemp, &onlineHum);
+  
+  if (haveOnline) {
+    Serial.print("online: ");
+    Serial.print(onlineTemp);
+    Serial.print(" C, ");
+    Serial.print(onlineHum);
+    Serial.println("%");
+    Serial.print("diff: ");
+    Serial.print(localTemp - onlineTemp);
+    Serial.println(" C");
+  } else {
+    Serial.println("online weather failed");
+  }
+  
+  // send
+  if (!sendData(localTemp, localHum, onlineTemp, onlineHum, haveOnline)) {
+    Serial.println("thingspeak failed");
+  }
+  
+  Serial.println("---");
+}
